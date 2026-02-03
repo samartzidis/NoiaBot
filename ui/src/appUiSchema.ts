@@ -1,6 +1,4 @@
-
-
-const systemUiSchema = {
+const appUiSchema = {
     type: "VerticalLayout",
     elements: [
         {
@@ -14,11 +12,13 @@ const systemUiSchema = {
                 { type: "Control", scope: "#/properties/MemoryServiceMaxMemories" },                
                 { type: "Control", scope: "#/properties/PlaybackVolume" },
                 { type: "Control", scope: "#/properties/WakeWordSilenceSampleAmplitudeThreshold" },
-                { type: "Control", scope: "#/properties/FileLoggingEnabled" },
                 { type: "Control", scope: "#/properties/S330Enabled" },
+                { type: "Control", scope: "#/properties/FileLoggingEnabled" },
+                { type: "Control", scope: "#/properties/NightModeEnabled" },
+                { type: "Control", scope: "#/properties/NightModeIdleTimeoutMinutes" },                
             ]
       }
     ]
   };
 
-export default systemUiSchema; 
+export default appUiSchema;

@@ -7,15 +7,21 @@ public class AppConfig
 {
     public bool ConsoleDebugMode { get; set; }
 
-    [DisplayName("Enable File Logging")]
+    [DisplayName("File Logging")]
     [Description("Enable file logging in the application directory. Defaults to: 'false'.")]
     [DefaultValue(false)]
     public bool FileLoggingEnabled { get; set; }
 
-    // [DisplayName("Enable Night Mode")]
-    // [Description("Enable night mode. In this mode, eyes will stay off when idle. Defaults to: 'false'.")]
-    // [DefaultValue(false)]
-    // public bool NightModeEnabled { get; set; }
+    [DisplayName("Night Mode")]
+    [Description("Enable night mode. In this mode, eyes will automatically turn off when idle for more than the configured timeout. Defaults to: 'false'.")]
+    [DefaultValue(false)]
+    public bool NightModeEnabled { get; set; }
+
+    [DisplayName("Night Mode Idle Timeout Minutes")]
+    [Description("Minutes of inactivity before night mode turns eyes off. Only applies when night mode is enabled. Defaults to: '10'.")]
+    [DefaultValue(10)]
+    [Range(1, 600)]
+    public int NightModeIdleTimeoutMinutes { get; set; } = 10;
 
     [Required]
     [DisplayName("OpenAI API Key")]
@@ -49,7 +55,7 @@ public class AppConfig
     [Range(10, 1000)]
     public int MemoryServiceMaxMemories { get; set; } = 100;
 
-    [DisplayName("Playback Volume")]
+    [DisplayName("Startup Playback Volume")]
     [Description("Startup playback volume level (0-10). If unspecified the system will not set the volume level at startup.")]
     [DefaultValue(null)]
     [Range(0, 10)]
@@ -61,7 +67,7 @@ public class AppConfig
     [Range(0, 10000)]
     public int WakeWordSilenceSampleAmplitudeThreshold { get; set; } = 800;
 
-    [DisplayName("Enable Anker PowerConf S330 Driver")]
+    [DisplayName("Anker PowerConf S330 Driver")]
     [Description("Enable device driver for Anker PowerConf S330 speakerphone.")]
     public bool S330Enabled { get; set; }
 

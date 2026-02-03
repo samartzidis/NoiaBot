@@ -858,7 +858,7 @@ public sealed class RealtimeAgent : IDisposable
     /// <summary>
     /// Processes a function result into a string suitable for the Realtime API.
     /// </summary>
-    public string ProcessFunctionResult(object? functionResult)
+    public string ProcessFunctionResult(object functionResult)
     {
         if (functionResult is string stringResult)
         {

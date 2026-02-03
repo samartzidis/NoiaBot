@@ -135,7 +135,7 @@ public class Speaker : IDisposable
     /// </summary>
     /// <param name="preferredBackends">Optional array of preferred audio backends to use (e.g., PvSpeaker.LinuxAlsaOnly on Linux)</param>
     /// <returns>Array of device names</returns>
-    public static string[] GetAvailableDevices(MiniAudioBackend[]? preferredBackends = null)
+    public static string[] GetAvailableDevices(MiniAudioBackend[] preferredBackends = null)
     {
         try
         {
