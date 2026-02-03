@@ -1,7 +1,7 @@
 # NoiaBot
 <img src="logo.png" alt="NoiaBot Logo" height="240"/>
 
-**NoiaBot** is a free, Raspberry Pi powered AI **real-time** chat robot. It is ideal for **teaching assistance**. It can answer or help clarify challenging questions on a wide range of subjects and serve as a live encyclopedia. 
+**NoiaBot** is a free, Raspberry Pi powered **real-time** AI chat robot. It is ideal for **teaching assistance**. It can answer or help clarify challenging questions on a wide range of subjects and serve as a live encyclopedia. 
 
 Its focus on real-time aspects, allows it to keep a highly responsive live conversational experience with the user. It allows user interruptions (barge-in) while the robot is still speaking and maintaining the correct live conversation state context.
 
