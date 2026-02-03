@@ -141,7 +141,7 @@ Optionally, add permissions to user `pi` to open hidraw devices. Only needed if 
    sudo udevadm trigger
    ```
 
-### Captive Portal Device Software Installation
+### Captive Portal Device Software Installation (Optional)
 
 You can optionally install Captive Portal Device software so that whenever NoiaBot loses network connectivity or needs to connect to a new WiFi network, you can do it remotely using your mobile phone or PC by connecting to NoiaBot directly (NoiaBot switches to Access Point mode). The following installation instructions are based on Raspberry Pi OS (64-bit) 13 (trixie):
 
