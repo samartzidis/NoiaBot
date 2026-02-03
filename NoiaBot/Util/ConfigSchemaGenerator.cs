@@ -1,0 +1,34 @@
+using Newtonsoft.Json.Schema.Generation;
+using Newtonsoft.Json.Schema;
+using System.Collections.Concurrent;
+using Newtonsoft.Json;
+
+namespace NoiaBot.Util;
+
+internal static class ConfigSchemaGenerator
+{
+    private static readonly ConcurrentDictionary<Type, JSchema> _schemaCache = new();
+
+    public static JSchema GetSchema<T>()
+    {
+        if (_schemaCache.TryGetValue(typeof(T), out var schema))
+            return schema;
+
+        var schemaGen = new JSchemaGenerator
+        {
+            SchemaIdGenerationHandling = SchemaIdGenerationHandling.TypeName,
+            DefaultRequired = Required.Default, // Only apply 'required' if explicitly marked with [Required]
+            SchemaLocationHandling = SchemaLocationHandling.Inline,
+            SchemaReferenceHandling = SchemaReferenceHandling.None
+        };
+
+        // Add default generation providers
+        schemaGen.GenerationProviders.Add(new StringEnumGenerationProvider());
+
+        schema = schemaGen.Generate(typeof(T));
+
+        _schemaCache[typeof(T)] = schema;
+
+        return schema;
+    }
+}

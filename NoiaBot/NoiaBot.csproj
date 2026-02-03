@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>NoiaBot</RootNamespace>
+    <AssemblyName>NoiaBot</AssemblyName>
+    <Version>1.0.0</Version>
+    <IsPackable>false</IsPackable>    
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>1701;1702;1998;CS1591;SKEXP0050;SKEXP0101;SKEXP0101;SKEXP0110;SKEXP0001;OPENAI001;OPENAI002;SKEXP0010;SKEXP0020</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="HidSharp" Version="2.6.4" />
+    <PackageReference Include="Microsoft.Extensions.AI" Version="10.2.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.2.0" />    
+    <PackageReference Include="NanoWakeWord" Version="1.2.1" />
+    <PackageReference Include="NetEscapades.Configuration.Yaml" Version="3.1.0" />
+    <PackageReference Include="Newtonsoft.Json.Schema" Version="4.0.1" />
+    <PackageReference Include="Serilog.Extensions.Hosting" Version="10.0.0" />
+    <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
+    <PackageReference Include="Serilog.Settings.Configuration" Version="10.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <PackageReference Include="DataAnnotationsValidator.NETCore" Version="1.0.3" />
+    <PackageReference Include="PvRecorder" Version="1.2.13" />    
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.70.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Agents.Core" Version="1.70.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Agents.OpenAI" Version="1.70.0-preview" />
+    <PackageReference Include="Microsoft.SemanticKernel.Plugins.Core" Version="1.70.0-preview" />
+    <PackageReference Include="Microsoft.SemanticKernel.Yaml" Version="1.70.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.70.0" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.1.0" />   
+    <PackageReference Include="System.Device.Gpio" Version="4.1.0" />
+    <PackageReference Include="SoundFlow" Version="1.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Remove="C:\Users\gs\.nuget\packages\soundflow\1.4.0\contentFiles\any\net8.0\STATEMENT.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.local.yaml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="appsettings.yaml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Resources\silero_vad.onnx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="wwwroot\jsonforms\index.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Resources\models\constantina.onnx" />
+    <None Remove="Resources\models\hey_anna.onnx" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\models\constantina.onnx" />
+    <EmbeddedResource Include="Resources\models\hey_anna.onnx" />
+  </ItemGroup>
+
+</Project>

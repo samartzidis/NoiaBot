@@ -1,0 +1,26 @@
+using NoiaBot.Services;
+
+namespace NoiaBot.Events;
+
+public class StartListeningEvent(object sender) : EventBase(sender);
+public class StopListeningEvent(object sender) : EventBase(sender);
+
+public class TalkLevelEvent(object sender, byte? level, bool skipLogging) : EventBase(sender, skipLogging)
+{
+    public byte? Level { get; } = level;    
+}
+
+public class ShutdownEvent(object sender) : EventBase(sender);
+
+public class FunctionInvokingEvent(object sender) : EventBase(sender);
+public class FunctionInvokedEvent(object sender) : EventBase(sender);
+
+public class SystemErrorEvent(object sender) : EventBase(sender);
+public class SystemOkEvent(object sender) : EventBase(sender);
+
+public class WakeWordDetectedEvent(object sender) : EventBase(sender);
+
+public class NoiseDetectedEvent(object sender) : EventBase(sender);
+public class SilenceDetectedEvent(object sender) : EventBase(sender);
+
+public class ConfigChangedEvent(object sender) : EventBase(sender);

@@ -1,0 +1,75 @@
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+
+namespace NoiaBot.Configuration;
+
+public class AppConfig
+{
+    public bool ConsoleDebugMode { get; set; }
+
+    [DisplayName("Enable File Logging")]
+    [Description("Enable file logging in the application directory. Defaults to: 'false'.")]
+    [DefaultValue(false)]
+    public bool FileLoggingEnabled { get; set; }
+
+    // [DisplayName("Enable Night Mode")]
+    // [Description("Enable night mode. In this mode, eyes will stay off when idle. Defaults to: 'false'.")]
+    // [DefaultValue(false)]
+    // public bool NightModeEnabled { get; set; }
+
+    [Required]
+    [DisplayName("OpenAI API Key")]
+    [Description("OpenAI API access key.")]    
+    public string OpenAiApiKey { get; set; }
+
+    [Required]
+    [DisplayName("OpenAI Model")]
+    [Description("OpenAI model to use. Defaults to: 'gpt-4o-mini-realtime-preview'.")]    
+    public string OpenAiModel { get; set; } = "gpt-4o-mini-realtime-preview";
+
+    [DisplayName("Global Instructions (modifying this may break correct system functionality)")]
+    [Description("Global system instructions for all agents.")]
+    public string Instructions { get; set; }
+
+    [DisplayName("Session Timeout Minutes")]
+    [Description("Session timeout in minutes. When the session is idle for this number of minutes, it will be automatically closed. Defaults to: '30'.")]
+    [DefaultValue(30)]
+    [Range(1, 60)]
+    public int SessionTimeoutMinutes { get; set; } = 30;
+
+    [DisplayName("Conversation Inactivity Timeout Seconds")]
+    [Description("Conversation inactivity timeout in seconds. When the conversation is inactive for this number of seconds, it will be automatically go back to Wake Word detection mode. Defaults to: '10'.")]
+    [DefaultValue(10)]
+    [Range(1, 60)]
+    public int ConversationInactivityTimeoutSeconds { get; set; } = 10;
+
+    [DisplayName("Memory Service Max Memories")]
+    [Description("Maximum number of memories to store. When exceeded, least frequently used memories will be evicted. Defaults to: '100'.")]
+    [DefaultValue(100)]
+    [Range(10, 1000)]
+    public int MemoryServiceMaxMemories { get; set; } = 100;
+
+    [DisplayName("Playback Volume")]
+    [Description("Startup playback volume level (0-10). If unspecified the system will not set the volume level at startup.")]
+    [DefaultValue(null)]
+    [Range(0, 10)]
+    public int? PlaybackVolume { get; set; }
+
+    [DisplayName("Wake Word Silence Sample Amplitude Threshold")]
+    [Description("Threshold for silence detection in wake word. Defaults to: '800'.")]
+    [DefaultValue(800)]
+    [Range(0, 10000)]
+    public int WakeWordSilenceSampleAmplitudeThreshold { get; set; } = 800;
+
+    [DisplayName("Enable Anker PowerConf S330 Driver")]
+    [Description("Enable device driver for Anker PowerConf S330 speakerphone.")]
+    public bool S330Enabled { get; set; }
+
+    public List<AgentConfig> Agents { get; set; } = [ ];
+
+    internal readonly string[] OpenAiVoiceNames = [ "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar" ];
+    internal readonly string[] OpenAiModels = [ "gpt-realtime", "gpt-realtime-mini", "gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"]; // Also see: https://platform.openai.com/docs/pricing
+}
+
+
+
