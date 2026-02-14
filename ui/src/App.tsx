@@ -41,12 +41,12 @@ const AppContent: React.FC = () => {
             <Button color="inherit" component={Link} to="/">
               Home
             </Button>
-            <Button color="inherit" component={Link} to="/config">
-              Agents
-            </Button>
             <Button color="inherit" component={Link} to="/system">
               System
             </Button>
+            <Button color="inherit" component={Link} to="/agents">
+              Agents
+            </Button>            
             <Button color="inherit" component={Link} to="/memory">
               Memory
             </Button>
@@ -60,12 +60,11 @@ const AppContent: React.FC = () => {
           <Routes>
             <Route path="/" element={
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 24, gap: 24 }}>
-                <Typography variant="h4">NoiaBot</Typography>
                 <img src={logo} alt="NoiaBot logo" style={{ maxWidth: '100%', height: 'auto' }} />
               </div>
             } />
-            <Route path="/config" element={<AgentsConfig />} />
             <Route path="/system" element={<SystemConfig />} />
+            <Route path="/agents" element={<AgentsConfig />} />            
             <Route path="/memory" element={<MemoryConfig />} />
             <Route path="/logs" element={<LogsConfig />} />
           </Routes>

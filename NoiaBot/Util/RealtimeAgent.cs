@@ -69,6 +69,8 @@ public sealed class RealtimeAgent : IDisposable
     // Shared state between receive task and audio loop
     private Speaker _currentSpeaker;
     private volatile bool _modelIsSpeaking;
+    private volatile bool _waitingForResponse;
+    private DateTime _responseRequestedAtUtc;
     private volatile Action<StateUpdate> _stateUpdateAction;
     private volatile bool _bargeInTriggered;
     
@@ -153,6 +155,7 @@ public sealed class RealtimeAgent : IDisposable
         }
 
         _stateUpdateAction = stateUpdateAction;
+        _waitingForResponse = false;
         stateUpdateAction?.Invoke(StateUpdate.Ready);
 
         // Start the conversation loop (audio capture)
@@ -263,6 +266,7 @@ public sealed class RealtimeAgent : IDisposable
                 // Model started generating response
                 if (update is OutputStreamingStartedUpdate streamingStartedUpdate)
                 {
+                    _waitingForResponse = false;
                     _modelIsSpeaking = true;
                     _stateUpdateAction?.Invoke(StateUpdate.SpeakingStarted);
                     _bargeInTriggered = false;
@@ -384,6 +388,8 @@ public sealed class RealtimeAgent : IDisposable
                 // Response finished
                 if (update is ResponseFinishedUpdate responseFinishedUpdate)
                 {
+                    _waitingForResponse = false;
+
                     // Write any remaining buffered audio
                     lock (_outputAudioLock)
                     {
@@ -413,6 +419,8 @@ public sealed class RealtimeAgent : IDisposable
                     if (responseFinishedUpdate.CreatedItems.Any(item => item.FunctionName?.Length > 0))
                     {
                         _logger.LogDebug("[Function calls detected - triggering response...]");
+                        _waitingForResponse = true;
+                        _responseRequestedAtUtc = DateTime.UtcNow;
                         await session.StartResponseAsync(sessionToken);
                     }
                     else
@@ -630,6 +638,8 @@ public sealed class RealtimeAgent : IDisposable
                             await session.SendInputAudioAsync(new MemoryStream(audioBytes), cancellationToken);
                             await session.CommitPendingAudioAsync(cancellationToken);
                             await session.StartResponseAsync(cancellationToken);
+                            _waitingForResponse = true;
+                            _responseRequestedAtUtc = DateTime.UtcNow;
 
                             isRecording = false;
                             audioBuffer.Clear();
@@ -640,8 +650,16 @@ public sealed class RealtimeAgent : IDisposable
                     }
                 }
 
+                // Safety: if we've been waiting for a model response for too long, give up
+                if (_waitingForResponse && (DateTime.UtcNow - _responseRequestedAtUtc).TotalSeconds > 30)
+                {
+                    _logger.LogWarning("[Response wait timeout - model did not respond within 30s]");
+                    _waitingForResponse = false;
+                }
+
                 // Check for inactivity timeout (since robot finished talking and user hasn't responded)
-                if (!isRecording && !_modelIsSpeaking)
+                // Don't timeout while waiting for the model to respond to our request
+                if (!isRecording && !_modelIsSpeaking && !_waitingForResponse)
                 {
                     var inactivityTimeout = TimeSpan.FromSeconds(_options.ConversationInactivityTimeoutSeconds ?? 10);
 
