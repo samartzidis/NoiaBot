@@ -3,8 +3,6 @@ using Microsoft.SemanticKernel;
 using System.ComponentModel;
 using NoiaBot.Services;
 
-#nullable enable
-
 namespace NoiaBot.Plugins.Native;
 
 public sealed class MemoryPlugin
