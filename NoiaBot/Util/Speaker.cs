@@ -106,15 +106,23 @@ public class Speaker : IDisposable
     }
 
     /// <summary>
-    /// Gets an estimated played duration in milliseconds based on consumed queue samples.
+    /// Gets an estimated played duration in milliseconds.
+    /// Subtracts samples still queued in downstream buffers from the total consumed count
+    /// to approximate what has actually reached the speaker hardware.
     /// </summary>
     public int GetEstimatedPlayedMilliseconds()
     {
         if (_sampleRate <= 0)
             return 0;
 
-        var playedSamples = GetEstimatedPlayedSampleCount();
-        return (int)((playedSamples * 1000L) / _sampleRate);
+        lock (_bufferLock)
+        {
+            var consumed = _dataProvider?.Position ?? 0;
+            var queued = _dataProvider?.SamplesAvailable ?? 0;
+            var played = consumed - queued;
+            if (played < 0) played = 0;
+            return (int)((played * 1000L) / _sampleRate);
+        }
     }
 
     /// <summary>

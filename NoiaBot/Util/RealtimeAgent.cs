@@ -2,13 +2,10 @@ using Azure.AI.OpenAI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.Connectors.OpenAI;
 using OpenAI.Realtime;
 using Pv;
 using System.ClientModel;
 using System.Text;
-using System.Text.Json;
-
 namespace NoiaBot.Util;
 
 public sealed class RealtimeAgentOptions
@@ -35,49 +32,40 @@ public enum StateUpdate
     SpeakingStopped
 }
 
-/// <summary>
-/// Manages a realtime conversation session with OpenAI using local VAD (Voice Activity Detection).
-/// The session persists across multiple RunAsync calls until the object is disposed.
-/// </summary>
 public sealed class RealtimeAgent : IDisposable
 {
-    // Audio configuration - must match Realtime API requirements
-    private const int SampleRate = 24000; // Realtime API uses 24kHz
-    private const int VadSampleRate = 16000; // Silero VAD uses 16kHz
-    private const int FrameLength = 512; // Frame size for VAD (matches 16kHz requirement)
+    // Audio constants
+    private const int SampleRate = 24000;
+    private const int VadSampleRate = 16000;
+    private const int FrameLength = 512;
     private const float VadThreshold = 0.5f;
-    private const int MinSpeechFrames = 3; // Minimum consecutive speech frames to start recording
-    private const int MinSpeechFramesForBargeIn = 2; // Fewer frames needed for barge-in (faster response)
-    private const double SilenceMillisecondsToStop = 1600; // Stop after ~1.6s of silence
-    private const int PreBufferFrames = 15; // Keep ~0.5s of audio before speech is detected
+    private const int MinSpeechFrames = 3;
+    private const int MinSpeechFramesForBargeIn = 2;
+    private const double SilenceMillisecondsToStop = 1600;
+    private const int PreBufferFrames = 15;
+    private const int SpeakerChunkSize = 4096;
 
+    // Dependencies (immutable after construction)
     private readonly Kernel _kernel;
     private readonly ILogger _logger;
     private readonly RealtimeAgentOptions _options;
-    private readonly object _speakerLock = new();
-    private readonly Dictionary<string, StringBuilder> _functionArgumentBuildersById = new();
 
+    // Session lifecycle
     private RealtimeClient _realtimeClient;
     private RealtimeSession _session;
+    private CancellationTokenSource _sessionCts;
+    private Task _receiveTask;
+    private int _receiveGeneration;
     private bool _disposed;
 
-    // Receive task runs for the lifetime of the session (not per RunAsync call)
-    private Task _receiveTask;
-    // Session CTS is independent - only cancelled on dispose, not on RunAsync cancellation
-    private CancellationTokenSource _sessionCts;
-    private int _receiveGeneration;
-
-    // Shared state between receive task and audio loop
-    private Speaker _currentSpeaker;
-    private volatile bool _modelIsSpeaking;
-    private volatile bool _waitingForResponse;
-    private DateTime _responseRequestedAtUtc;
-    private volatile Action<StateUpdate> _stateUpdateAction;
-    private volatile bool _bargeInTriggered;
-    
-    // Barge-in tracking for truncation
+    // Shared state between receive task and audio capture loop
+    // _outputAudioLock protects all playback-state transitions and output audio buffering.
+    // _speakerLock protects _currentSpeaker access.
+    private readonly object _speakerLock = new();
     private readonly object _outputAudioLock = new();
-    private string _currentStreamingItemId;
+    private readonly PlaybackSyncState _playbackState = new();
+    private Speaker _currentSpeaker;
+    private volatile Action<StateUpdate> _stateUpdateAction;
 
     public RealtimeAgent(ILogger<RealtimeAgent> logger, Kernel kernel, IOptions<RealtimeAgentOptions> options)
     {
@@ -86,111 +74,114 @@ public sealed class RealtimeAgent : IDisposable
         _options = options.Value;
     }
 
+    // Public API
 
     /// <summary>
     /// Runs the conversation loop until cancellation is requested or VAD inactivity timeout occurs.
-    /// Both cancellation and timeout preserve the session - call DisposeAsync to close the session.
+    /// Both cancellation and timeout preserve the session - call Dispose to close the session.
     /// </summary>
-    /// <returns>Why the loop returned.</returns>
     public async Task<RealtimeAgentRunResult> RunAsync(
         Action<StateUpdate> stateUpdateAction = null, 
         Action<byte> meterAction = null, 
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-
-        // Get the Realtime client
-        _realtimeClient ??= GetRealtimeConversationClient();
-
-        // Start a new conversation session
-        if (_session is null)
-        {
-            _logger.LogDebug("Connecting to OpenAI Realtime API...");
-
-            // Session CTS is independent - not linked to the RunAsync cancellation token
-            _sessionCts = new CancellationTokenSource();
-            _session = await _realtimeClient.StartConversationSessionAsync(
-                _options.Model,
-                cancellationToken: cancellationToken);
-
-            // Configure session with LOCAL VAD (server VAD disabled)
-            await ConfigureSessionAsync(_session, cancellationToken);
-
-            _logger.LogDebug("Session configured.");
-        }
+        await EnsureSessionConnectedAsync(cancellationToken);
 
         using var recorder = PvRecorder.Create(frameLength: FrameLength, deviceIndex: -1);
         using var speaker = new Speaker(sampleRate: SampleRate, bitsPerSample: 16, meterAction: meterAction);
         using var vadDetector = new SileroVadDetector(VadSampleRate);
-        
-        // Set current speaker for receive task to use
-        lock (_speakerLock)
-        {
-            _currentSpeaker = speaker;
-        }
 
+        lock (_speakerLock) { _currentSpeaker = speaker; }
         _logger.LogDebug($"Using microphone: {recorder.SelectedDevice}");
 
-        // Check if the receive task completed unexpectedly (WebSocket closed)
-        // If so, the session is dead and we need to reconnect
+        EnsureReceiveTaskRunning();
+        _stateUpdateAction = stateUpdateAction;
+        ClearWaitingForResponse();
+        stateUpdateAction?.Invoke(StateUpdate.Ready);
+
+        var ctx = new AudioCaptureContext
+        {
+            Session = _session,
+            Recorder = recorder,
+            Speaker = speaker,
+            VadDetector = vadDetector,
+            SessionToken = _sessionCts!.Token,
+            CancellationToken = cancellationToken
+        };
+
+        var result = await AudioCaptureLoopAsync(ctx);
+        lock (_speakerLock) { _currentSpeaker = null; }
+        return result;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) 
+            return;
+        _disposed = true;
+
+        _sessionCts?.Cancel();
+
+        if (_session is IDisposable disposable)
+            disposable.Dispose();
+
+        _sessionCts?.Dispose();
+        _session = null;
+        _sessionCts = null;
+        _receiveTask = null;
+    }
+
+    // Session lifecycle
+
+    private async Task EnsureSessionConnectedAsync(CancellationToken cancellationToken)
+    {
+        _realtimeClient ??= CreateRealtimeClient();
+
+        if (_session is null)
+        {
+            _logger.LogDebug("Connecting to OpenAI Realtime API...");
+            _sessionCts = new CancellationTokenSource();
+            _session = await _realtimeClient.StartConversationSessionAsync(
+                _options.Model, cancellationToken: cancellationToken);
+            await ConfigureSessionAsync(_session, cancellationToken);
+            _logger.LogDebug("Session configured.");
+            return;
+        }
+
+        // If the receive task finished unexpectedly the WebSocket is dead - reconnect
         if (_receiveTask is not null && _receiveTask.IsCompleted)
         {
             _logger.LogDebug("[Session connection lost - reconnecting...]");
             await ResetSessionAsync();
-
-            // Recreate session
             _sessionCts = new CancellationTokenSource();
             _session = await _realtimeClient.StartConversationSessionAsync(
-                _options.Model,
-                cancellationToken: cancellationToken);
-
-            // Reconfigure session
+                _options.Model, cancellationToken: cancellationToken);
             await ConfigureSessionAsync(_session, cancellationToken);
         }
-
-        // Start the receive task if not already running
-        if (_receiveTask is null || _receiveTask.IsCompleted)
-        {
-            int receiveGeneration = System.Threading.Interlocked.Increment(ref _receiveGeneration);
-            _receiveTask = RunReceiveTaskAsync(_session, _sessionCts!.Token, receiveGeneration);
-        }
-
-        _stateUpdateAction = stateUpdateAction;
-        _waitingForResponse = false;
-        stateUpdateAction?.Invoke(StateUpdate.Ready);
-
-        // Start the conversation loop (audio capture)
-        var result = await AudioCaptureLoopAsync(_session, recorder, speaker, vadDetector, _sessionCts!.Token, cancellationToken);
-
-        // Clear speaker reference when exiting
-        lock (_speakerLock)
-        {
-            _currentSpeaker = null;
-        }
-
-        return result;
     }
 
-    /// <summary>
-    /// Resets the session state asynchronously, cleaning up the old session.
-    /// </summary>
+    private void EnsureReceiveTaskRunning()
+    {
+        if (_receiveTask is not null && !_receiveTask.IsCompleted)
+            return;
+
+        int generation = System.Threading.Interlocked.Increment(ref _receiveGeneration);
+        _receiveTask = RunReceiveTaskAsync(_session, _sessionCts!.Token, generation);
+    }
+
     private async Task ResetSessionAsync()
     {
         if (_sessionCts is not null)
-        {
             await _sessionCts.CancelAsync();
-        }
 
         if (_receiveTask is not null)
         {
             try
             {
-                // Don't wait forever - websocket may be stuck and not observe cancellation
-                var completedTask = await Task.WhenAny(_receiveTask, Task.Delay(TimeSpan.FromSeconds(5)));
-                if (!ReferenceEquals(completedTask, _receiveTask))
-                {
+                var completed = await Task.WhenAny(_receiveTask, Task.Delay(TimeSpan.FromSeconds(5)));
+                if (!ReferenceEquals(completed, _receiveTask))
                     _logger.LogWarning("[ResetSession timed out waiting for receive task - continuing cleanup]");
-                }
             }
             catch
             {
@@ -200,14 +191,8 @@ public sealed class RealtimeAgent : IDisposable
 
         if (_session is IAsyncDisposable asyncDisposable)
         {
-            try
-            {
-                await asyncDisposable.DisposeAsync();
-            }
-            catch
-            {
-                // Ignore errors during cleanup
-            }
+            try { await asyncDisposable.DisposeAsync(); }
+            catch { /* ignore during cleanup */ }
         }
         else if (_session is IDisposable disposable)
         {
@@ -220,611 +205,6 @@ public sealed class RealtimeAgent : IDisposable
         _receiveTask = null;
     }
 
-    /// <summary>
-    /// Disposes the conversation synchronously.
-    /// Prefer DisposeAsync for graceful shutdown.
-    /// </summary>
-    public void Dispose()
-    {
-        if (_disposed) 
-            return;
-        _disposed = true;
-
-        // Cancel the session
-        _sessionCts?.Cancel();
-
-        // Don't wait for receive task in sync dispose - just cancel and move on
-
-        // Dispose the session
-        if (_session is IDisposable disposable)
-        {
-            disposable.Dispose();
-        }
-
-        _sessionCts?.Dispose();
-
-        _session = null;
-        _sessionCts = null;
-        _receiveTask = null;
-    }
-
-    /// <summary>
-    /// Receive task that runs for the lifetime of the session.
-    /// Uses the session-level cancellation token, not the per-RunAsync token.
-    /// </summary>
-    private async Task RunReceiveTaskAsync(RealtimeSession session, CancellationToken sessionToken, int receiveGeneration)
-    {
-        var outputAudioBuffer = new List<byte>();
-        const int SpeakerChunkSize = 4096; // ~85ms at 24kHz/16-bit (lower = less latency, snappier barge-in)
-
-        try
-        {
-            await foreach (RealtimeUpdate update in session.ReceiveUpdatesAsync(sessionToken))
-            {
-                if (sessionToken.IsCancellationRequested) break;
-                if (receiveGeneration != System.Threading.Volatile.Read(ref _receiveGeneration)) break;
-
-                // Session started
-                if (update is ConversationSessionStartedUpdate sessionStartedUpdate)
-                {
-                    _logger.LogDebug($"[Session started: {sessionStartedUpdate.SessionId}]");
-                }
-
-                // Model started generating response
-                if (update is OutputStreamingStartedUpdate streamingStartedUpdate)
-                {
-                    _waitingForResponse = false;
-                    _modelIsSpeaking = true;
-                    _stateUpdateAction?.Invoke(StateUpdate.SpeakingStarted);
-                    _bargeInTriggered = false;
-                    
-                    lock (_outputAudioLock)
-                    {
-                        outputAudioBuffer.Clear();
-                        _currentStreamingItemId = streamingStartedUpdate.ItemId;
-                    }
-
-                    _logger.LogDebug($"[OutputStreamingStarted: FunctionName={streamingStartedUpdate.FunctionName ?? "null"}, ItemId={streamingStartedUpdate.ItemId ?? "null"}]");
-
-                    if (!string.IsNullOrEmpty(streamingStartedUpdate.FunctionName))
-                    {
-                        _logger.LogDebug($"[Calling: {streamingStartedUpdate.FunctionName}] ");
-                    }
-                }
-
-                // Streaming delta (audio, text, function args)
-                if (update is OutputDeltaUpdate deltaUpdate)
-                {
-                    if (!string.IsNullOrEmpty(deltaUpdate.AudioTranscript))
-                    {
-                        _logger.LogDebug(deltaUpdate.AudioTranscript);
-                    }
-                    if (!string.IsNullOrEmpty(deltaUpdate.Text))
-                    {
-                        _logger.LogDebug($"[TextDelta: {deltaUpdate.Text}]");
-                    }
-
-                    // Handle audio bytes (use lock to synchronize with barge-in)
-                    if (deltaUpdate.AudioBytes is not null)
-                    {
-                        lock (_outputAudioLock)
-                        {
-                            if (!_bargeInTriggered)
-                            {
-                                var audioBytes = deltaUpdate.AudioBytes.ToArray();
-                                outputAudioBuffer.AddRange(audioBytes);
-
-                                while (outputAudioBuffer.Count >= SpeakerChunkSize)
-                                {
-                                    byte[] chunk = new byte[SpeakerChunkSize];
-                                    outputAudioBuffer.CopyTo(0, chunk, 0, SpeakerChunkSize);
-                                    outputAudioBuffer.RemoveRange(0, SpeakerChunkSize);
-                                    WriteSpeakerSafe(chunk);
-                                }
-                            }
-                        }
-                    }
-
-                    // Collect function arguments
-                    if (!string.IsNullOrWhiteSpace(deltaUpdate.FunctionArguments))
-                    {
-                        if (!_functionArgumentBuildersById.TryGetValue(deltaUpdate.ItemId, out var builder))
-                        {
-                            _functionArgumentBuildersById[deltaUpdate.ItemId] = builder = new StringBuilder();
-                        }
-                        builder.Append(deltaUpdate.FunctionArguments);
-
-                        // Log additional delta update properties for function calls
-                        _logger.LogDebug($"[FunctionArgsDelta: ItemId={deltaUpdate.ItemId}, FunctionCallId={deltaUpdate.FunctionCallId ?? "null"}, Args={deltaUpdate.FunctionArguments}]");
-                    }
-                }
-
-                // Item finished streaming
-                if (update is OutputStreamingFinishedUpdate streamingFinishedUpdate)
-                {
-                    _logger.LogDebug($"[OutputStreamingFinished: FunctionCallId={streamingFinishedUpdate.FunctionCallId ?? "null"}, FunctionName={streamingFinishedUpdate.FunctionName ?? "null"}, ItemId={streamingFinishedUpdate.ItemId ?? "null"}]");
-                    
-                    if (streamingFinishedUpdate.FunctionCallId is not null)
-                    {
-                        if (_kernel == null)
-                        {
-                            throw new InvalidOperationException(
-                                $"Function '{streamingFinishedUpdate.FunctionName}' was called but kernel is null. " +
-                                "A kernel must be provided when tools are configured in the session.");
-                        }
-
-                        _logger.LogDebug($"[Executing function: {streamingFinishedUpdate.FunctionName}]");
-
-                        RealtimeItem functionOutputItem;
-                        try
-                        {
-                            functionOutputItem = await InvokeFunctionAsync(
-                                streamingFinishedUpdate.FunctionName,
-                                streamingFinishedUpdate.FunctionCallId,
-                                streamingFinishedUpdate.ItemId,
-                                _functionArgumentBuildersById,
-                                _kernel,
-                                sessionToken);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, $"[Function '{streamingFinishedUpdate.FunctionName}' failed: {ex.Message}]");
-                            
-                            // Return error to model so it can respond appropriately
-                            functionOutputItem = RealtimeItem.CreateFunctionCallOutput(
-                                callId: streamingFinishedUpdate.FunctionCallId,
-                                output: $"Error: {ex.Message}");
-                        }
-                        finally
-                        {
-                            // Remove builder to prevent unbounded memory growth in long sessions
-                            _functionArgumentBuildersById.Remove(streamingFinishedUpdate.ItemId);
-                        }
-
-                        await session.AddItemAsync(functionOutputItem, sessionToken);
-                    }
-                    else if (streamingFinishedUpdate.MessageContentParts?.Count > 0)
-                    {
-                        
-                    }
-                }
-
-                // Input audio transcription completed (only if whisper transcription is enabled)
-                if (update is InputAudioTranscriptionFinishedUpdate transcriptionUpdate)
-                {
-                    _logger.LogDebug($"[You said: {transcriptionUpdate.Transcript}]");
-                }
-
-                // Response finished
-                if (update is ResponseFinishedUpdate responseFinishedUpdate)
-                {
-                    _waitingForResponse = false;
-
-                    // Write any remaining buffered audio
-                    lock (_outputAudioLock)
-                    {
-                        if (outputAudioBuffer.Count > 0 && !_bargeInTriggered)
-                        {
-                            byte[] remainingChunk = new byte[outputAudioBuffer.Count];
-                            outputAudioBuffer.CopyTo(remainingChunk, 0);
-                            WriteSpeakerSafe(remainingChunk);
-                            outputAudioBuffer.Clear();
-                        }
-                    }
-
-                    // Wait for playback to finish (allows barge-in during playback since _modelIsSpeaking stays true)
-                    await FlushSpeakerSafeAsync(sessionToken);
-                    _modelIsSpeaking = false;
-                    _stateUpdateAction?.Invoke(StateUpdate.SpeakingStopped);
-
-                    // Log created items for debugging
-                    _logger.LogDebug($"[ResponseFinished: {responseFinishedUpdate.CreatedItems.Count} items created]");
-                    
-                    foreach (var item in responseFinishedUpdate.CreatedItems)
-                    {
-                        _logger.LogDebug($"  - Item: FunctionName={item.FunctionName ?? "null"}, FunctionCallId={item.FunctionCallId ?? "null"}, MessageRole={item.MessageRole}");
-                    }
-
-                    if (responseFinishedUpdate.CreatedItems.Any(item => item.FunctionName?.Length > 0))
-                    {
-                        _logger.LogDebug("[Function calls detected - triggering response...]");
-                        _waitingForResponse = true;
-                        _responseRequestedAtUtc = DateTime.UtcNow;
-                        await session.StartResponseAsync(sessionToken);
-                    }
-                    else
-                    {
-                        _logger.LogDebug("[Ready for your next question...]");
-                    }
-                }
-
-                // Handle errors
-                if (update is RealtimeErrorUpdate errorUpdate)
-                {
-                    _logger.LogError($"[Error: {errorUpdate.Message}]");
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected when session is cancelled (dispose)
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug($"[Receive task error: {ex.Message}]");
-        }
-    }
-
-    /// <summary>
-    /// Safely write to speaker (may be null during audio device transitions).
-    /// </summary>
-    private void WriteSpeakerSafe(byte[] data)
-    {
-        lock (_speakerLock)
-        {
-            _currentSpeaker?.Write(data);
-        }
-    }
-
-    /// <summary>
-    /// Safely clear speaker buffer.
-    /// </summary>
-    private void ClearSpeakerSafe()
-    {
-        lock (_speakerLock)
-        {
-            _currentSpeaker?.Clear();
-        }
-    }
-
-    /// <summary>
-    /// Safely wait for speaker playback to finish.
-    /// </summary>
-    private async Task FlushSpeakerSafeAsync(CancellationToken cancellationToken)
-    {
-        Speaker speaker;
-        lock (_speakerLock)
-        {
-            speaker = _currentSpeaker;
-        }
-
-        if (speaker != null)
-        {
-            await speaker.FlushAsync(cancellationToken);
-        }
-    }
-
-    /// <summary>
-    /// Audio capture loop - runs until cancellation or inactivity timeout.
-    /// Neither cancellation nor timeout closes the session.
-    /// </summary>
-    private async Task<RealtimeAgentRunResult> AudioCaptureLoopAsync(
-        RealtimeSession session,
-        PvRecorder recorder,
-        Speaker speaker,
-        SileroVadDetector vadDetector,
-        CancellationToken sessionToken,
-        CancellationToken cancellationToken)
-    {
-        var audioBuffer = new List<short>();
-        var preBuffer = new Queue<short[]>();
-        bool isRecording = false;
-        int speechFrameCount = 0;
-        int bargeInSpeechFrameCount = 0;
-        double silenceDurationMs = 0;
-        bool wasModelSpeaking = false;
-        var lastActivityUtc = DateTime.UtcNow;
-
-        recorder.Start();
-        speaker.Start();
-
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                var frame = recorder.Read();
-                double frameDurationMs = (frame.Length * 1000.0) / recorder.SampleRate;
-
-                // Downsample from recorder rate to VAD rate if needed
-                var vadFrame = DownsampleForVad(frame, recorder.SampleRate, VadSampleRate, FrameLength);
-
-                // Convert to float for VAD
-                var floatFrame = new float[vadFrame.Length];
-                for (int i = 0; i < vadFrame.Length; i++)
-                {
-                    floatFrame[i] = vadFrame[i] / 32768.0f;
-                }
-
-                // Run VAD
-                float speechProb = vadDetector.Process(floatFrame);
-                bool isSpeech = speechProb >= VadThreshold;
-                if (isSpeech)
-                {
-                    lastActivityUtc = DateTime.UtcNow;
-                }
-
-                // Reset inactivity timer when model finishes speaking
-                if (wasModelSpeaking && !_modelIsSpeaking)
-                {
-                    lastActivityUtc = DateTime.UtcNow;
-                }
-                wasModelSpeaking = _modelIsSpeaking;
-
-                // If model is speaking, require consecutive speech frames before barge-in
-                if (_modelIsSpeaking)
-                {
-                    if (isSpeech)
-                    {
-                        bargeInSpeechFrameCount++;
-                        if (bargeInSpeechFrameCount >= MinSpeechFramesForBargeIn)
-                        {
-                            string truncateItemId;
-                            
-                            lock (_outputAudioLock)
-                            {
-                                _bargeInTriggered = true;
-                                truncateItemId = _currentStreamingItemId;
-                            }
-
-                            // Estimate heard audio from playback consumption instead of bytes written.
-                            // This is closer to what reached the user than queued/written byte counts.
-                            int audioEndMs = speaker.GetEstimatedPlayedMilliseconds();
-                            
-                            _logger.LogWarning($"[Barge-in detected - interrupting model at {audioEndMs}ms, ItemId={truncateItemId}]");
-
-                            ClearSpeakerSafe(); // Clear buffered audio immediately
-
-                            try
-                            {
-                                await session.CancelResponseAsync(sessionToken);
-                                
-                                if (truncateItemId is not null)
-                                {
-                                    // Tell the server how much audio the user actually heard
-                                    // so its conversation history matches reality
-                                    await session.TruncateItemAsync(truncateItemId, 0, TimeSpan.FromMilliseconds(audioEndMs), sessionToken);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogDebug($"[Cancel/truncate failed: {ex.Message}]");
-                            }
-
-                            _modelIsSpeaking = false;
-                            _stateUpdateAction?.Invoke(StateUpdate.SpeakingStopped);
-                            isRecording = true;
-                            audioBuffer.Clear();
-                            vadDetector.Reset();
-                            speechFrameCount = 0;
-                            bargeInSpeechFrameCount = 0;
-                            silenceDurationMs = 0;
-                        }
-                    }
-                    else
-                    {
-                        bargeInSpeechFrameCount = 0;
-                    }
-                }
-                else
-                {
-                    bargeInSpeechFrameCount = 0;
-                }
-
-                // Maintain pre-buffer when not recording
-                if (!isRecording)
-                {
-                    var upsampledFrame = UpsampleTo24kHz(frame, recorder.SampleRate);
-                    preBuffer.Enqueue(upsampledFrame);
-                    while (preBuffer.Count > PreBufferFrames)
-                        preBuffer.Dequeue();
-                }
-
-                // State machine for recording
-                if (!isRecording && !_modelIsSpeaking)
-                {
-                    if (isSpeech)
-                    {
-                        speechFrameCount++;
-                        if (speechFrameCount >= MinSpeechFrames)
-                        {
-                            _logger.LogDebug("[Voice detected - recording...]");
-                            isRecording = true;
-                            audioBuffer.Clear();
-
-                            while (preBuffer.Count > 0)
-                                audioBuffer.AddRange(preBuffer.Dequeue());
-
-                            silenceDurationMs = 0;
-                        }
-                    }
-                    else
-                    {
-                        speechFrameCount = 0;
-                    }
-                }
-                else if (isRecording)
-                {
-                    var upsampledFrame = UpsampleTo24kHz(frame, recorder.SampleRate);
-                    audioBuffer.AddRange(upsampledFrame);
-
-                    if (isSpeech)
-                    {
-                        silenceDurationMs = 0;
-                    }
-                    else
-                    {
-                        silenceDurationMs += frameDurationMs;
-                        if (silenceDurationMs >= SilenceMillisecondsToStop)
-                        {
-                            _logger.LogDebug("[Silence detected - sending to model...]");
-
-                            var audioBytes = ShortsToBytes(audioBuffer.ToArray());
-                            await session.SendInputAudioAsync(new MemoryStream(audioBytes), cancellationToken);
-                            await session.CommitPendingAudioAsync(cancellationToken);
-                            await session.StartResponseAsync(cancellationToken);
-                            _waitingForResponse = true;
-                            _responseRequestedAtUtc = DateTime.UtcNow;
-
-                            isRecording = false;
-                            audioBuffer.Clear();
-                            silenceDurationMs = 0;
-                            speechFrameCount = 0;
-                            vadDetector.Reset();
-                        }
-                    }
-                }
-
-                // Safety: if we've been waiting for a model response for too long, give up
-                if (_waitingForResponse && (DateTime.UtcNow - _responseRequestedAtUtc).TotalSeconds > 30)
-                {
-                    _logger.LogWarning("[Response wait timeout - model did not respond within 30s]");
-                    _waitingForResponse = false;
-                }
-
-                // Check for inactivity timeout (since robot finished talking and user hasn't responded)
-                // Don't timeout while waiting for the model to respond to our request
-                if (!isRecording && !_modelIsSpeaking && !_waitingForResponse)
-                {
-                    var inactivityTimeout = TimeSpan.FromSeconds(_options.ConversationInactivityTimeoutSeconds ?? 10);
-
-                    if (DateTime.UtcNow - lastActivityUtc >= inactivityTimeout)
-                    {
-                        _logger.LogDebug("[Inactivity timeout - pausing audio capture...]");
-                        return RealtimeAgentRunResult.InactivityTimeout;
-                    }
-                }
-
-                // Small delay to prevent CPU spinning
-                await Task.Delay(1, cancellationToken);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected when cancellation is requested - session stays alive
-        }
-        finally
-        {
-            recorder.Stop();
-            speaker.Stop();
-        }
-
-        return RealtimeAgentRunResult.Cancelled;
-    }
-
-    private short[] DownsampleForVad(short[] input, int inputRate, int outputRate, int outputLength)
-    {
-        if (inputRate == outputRate && input.Length == outputLength)
-            return input;
-
-        var result = new short[outputLength];
-        double ratio = (double)inputRate / outputRate;
-
-        for (int i = 0; i < outputLength; i++)
-        {
-            int srcIndex = (int)(i * ratio);
-            if (srcIndex < input.Length)
-                result[i] = input[srcIndex];
-        }
-
-        return result;
-    }
-
-    private short[] UpsampleTo24kHz(short[] input, int inputRate)
-    {
-        if (inputRate == 24000)
-            return input;
-
-        double ratio = 24000.0 / inputRate;
-        int outputLength = (int)(input.Length * ratio);
-        var result = new short[outputLength];
-
-        for (int i = 0; i < outputLength; i++)
-        {
-            double srcPos = i / ratio;
-            int srcIndex = (int)srcPos;
-            double frac = srcPos - srcIndex;
-
-            if (srcIndex + 1 < input.Length)
-            {
-                // Linear interpolation between adjacent samples
-                result[i] = (short)(input[srcIndex] * (1.0 - frac) + input[srcIndex + 1] * frac);
-            }
-            else if (srcIndex < input.Length)
-            {
-                result[i] = input[srcIndex];
-            }
-        }
-
-        return result;
-    }
-
-    private byte[] ShortsToBytes(short[] shorts)
-    {
-        var bytes = new byte[shorts.Length * 2];
-        Buffer.BlockCopy(shorts, 0, bytes, 0, bytes.Length);
-        return bytes;
-    }
-
-    private RealtimeClient GetRealtimeConversationClient()
-    {
-        var apiKey = _options.OpenAiApiKey;
-        var endpoint = _options.OpenAiEndpoint;
-
-        // OpenAI (platform) usage: API key set, endpoint not set
-        if (!string.IsNullOrWhiteSpace(apiKey) && string.IsNullOrWhiteSpace(endpoint))
-        {
-            return new RealtimeClient(new ApiKeyCredential(apiKey));
-        }
-
-        // Azure OpenAI usage: API key set, endpoint set
-        if (!string.IsNullOrWhiteSpace(apiKey) && !string.IsNullOrWhiteSpace(endpoint))
-        {
-            var client = new AzureOpenAIClient(
-                endpoint: new Uri(endpoint),
-                credential: new ApiKeyCredential(apiKey)); // If your package expects AzureKeyCredential, swap it
-
-            return client.GetRealtimeClient();
-        }
-
-        throw new InvalidOperationException(
-            "OpenAI/Azure OpenAI configuration was not found. " +
-            "Please set OpenAiApiKey and optionally OpenAiEndpoint.");
-    }
-
-    #region ToolHelpers
-    private const string FunctionNameSeparator = "-";
-
-    /// <summary>
-    /// Invokes a function call from the Realtime API and returns the output item.
-    /// </summary>
-    public async Task<RealtimeItem> InvokeFunctionAsync(
-        string functionName,
-        string functionCallId,
-        string itemId,
-        Dictionary<string, StringBuilder> functionArgumentBuildersById,
-        Kernel kernel,
-        CancellationToken cancellationToken)
-    {
-        var (parsedFunctionName, pluginName) = ParseFunctionName(functionName);
-        var argumentsString = functionArgumentBuildersById.GetValueOrDefault(itemId)?.ToString() ?? "{}";
-        var arguments = DeserializeArguments(argumentsString);
-
-        var functionCallContent = new FunctionCallContent(
-            functionName: parsedFunctionName,
-            pluginName: pluginName,
-            id: functionCallId,
-            arguments: arguments);
-
-        var resultContent = await functionCallContent.InvokeAsync(kernel, cancellationToken);
-
-        return RealtimeItem.CreateFunctionCallOutput(
-            callId: functionCallId,
-            output: ProcessFunctionResult(resultContent.Result));
-    }
-
-    /// <summary>
-    /// Configures a conversation session with standard options (voice, audio format, instructions, tools).
-    /// </summary>
     private async Task ConfigureSessionAsync(RealtimeSession session, CancellationToken cancellationToken)
     {
         var sessionOptions = new ConversationSessionOptions()
@@ -833,13 +213,13 @@ public sealed class RealtimeAgent : IDisposable
             InputAudioFormat = RealtimeAudioFormat.Pcm16,
             OutputAudioFormat = RealtimeAudioFormat.Pcm16,
             Instructions = _options.Instructions,
-            TurnDetectionOptions = TurnDetectionOptions.CreateDisabledTurnDetectionOptions(), // Disable server-side VAD - we handle it locally
+            TurnDetectionOptions = TurnDetectionOptions.CreateDisabledTurnDetectionOptions(),
             Temperature = _options.Temperature
         };
 
         if (_kernel != null)
         {
-            foreach (var tool in ConvertFunctions(_kernel))
+            foreach (var tool in KernelToolInvoker.ConvertKernelFunctions(_kernel))
             {
                 _logger.LogDebug($"[Adding tool: {tool.Name}: {tool.Description}]");
                 sessionOptions.Tools.Add(tool);
@@ -852,77 +232,609 @@ public sealed class RealtimeAgent : IDisposable
         await session.ConfigureConversationSessionAsync(sessionOptions, cancellationToken);
     }
 
-    /// <summary>
-    /// Converts Semantic Kernel plugins to OpenAI Realtime conversation tools.
-    /// </summary>
-    public IEnumerable<ConversationFunctionTool> ConvertFunctions(Kernel kernel)
+    private RealtimeClient CreateRealtimeClient()
     {
-        foreach (var plugin in kernel.Plugins)
+        var apiKey = _options.OpenAiApiKey;
+        var endpoint = _options.OpenAiEndpoint;
+
+        if (!string.IsNullOrWhiteSpace(apiKey) && string.IsNullOrWhiteSpace(endpoint))
+            return new RealtimeClient(new ApiKeyCredential(apiKey));
+
+        if (!string.IsNullOrWhiteSpace(apiKey) && !string.IsNullOrWhiteSpace(endpoint))
         {
-            var functionsMetadata = plugin.GetFunctionsMetadata();
+            var client = new AzureOpenAIClient(
+                endpoint: new Uri(endpoint),
+                credential: new ApiKeyCredential(apiKey));
+            return client.GetRealtimeClient();
+        }
 
-            foreach (var metadata in functionsMetadata)
+        throw new InvalidOperationException(
+            "OpenAI/Azure OpenAI configuration was not found. " +
+            "Please set OpenAiApiKey and optionally OpenAiEndpoint.");
+    }
+
+    // Receive loop - processes server updates for the session lifetime
+
+    private async Task RunReceiveTaskAsync(RealtimeSession session, CancellationToken sessionToken, int receiveGeneration)
+    {
+        var ctx = new ReceiveContext(session, sessionToken);
+
+        try
+        {
+            await foreach (RealtimeUpdate update in session.ReceiveUpdatesAsync(sessionToken))
             {
-                var toolDefinition = metadata.ToOpenAIFunction().ToFunctionDefinition(false);
+                if (sessionToken.IsCancellationRequested) break;
+                if (receiveGeneration != System.Threading.Volatile.Read(ref _receiveGeneration)) break;
+                await DispatchReceiveUpdateAsync(update, ctx);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when session is cancelled (dispose)
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug($"[Receive task error: {ex.Message}]");
+        }
+    }
 
-                yield return new ConversationFunctionTool(name: toolDefinition.FunctionName)
+    private async Task DispatchReceiveUpdateAsync(RealtimeUpdate update, ReceiveContext ctx)
+    {
+        switch (update)
+        {
+            case ConversationSessionStartedUpdate started:
+                _logger.LogDebug($"[Session started: {started.SessionId}]");
+                break;
+            case OutputStreamingStartedUpdate streamStart:
+                HandleStreamingStarted(streamStart, ctx);
+                break;
+            case OutputDeltaUpdate delta:
+                HandleOutputDelta(delta, ctx);
+                break;
+            case OutputStreamingFinishedUpdate streamEnd:
+                await HandleStreamingFinishedAsync(streamEnd, ctx);
+                break;
+            case InputAudioTranscriptionFinishedUpdate transcription:
+                _logger.LogDebug($"[You said: {transcription.Transcript}]");
+                break;
+            case ResponseFinishedUpdate responseEnd:
+                await HandleResponseFinishedAsync(responseEnd, ctx);
+                break;
+            case RealtimeErrorUpdate error:
+                _logger.LogError($"[Error: {error.Message}]");
+                break;
+        }
+    }
+
+    private void HandleStreamingStarted(OutputStreamingStartedUpdate update, ReceiveContext ctx)
+    {
+        _stateUpdateAction?.Invoke(StateUpdate.SpeakingStarted);
+
+        lock (_outputAudioLock)
+        {
+            _playbackState.WaitingForResponse = false;
+            _playbackState.ResponseRequestedAtUtc = default;
+            _playbackState.ModelIsSpeaking = true;
+            _playbackState.BargeInTriggered = false;
+            _playbackState.CurrentStreamingItemId = update.ItemId;
+            ctx.OutputAudioBuffer.Clear();
+        }
+
+        _logger.LogDebug($"[OutputStreamingStarted: FunctionName={update.FunctionName ?? "null"}, ItemId={update.ItemId ?? "null"}]");
+
+        if (!string.IsNullOrEmpty(update.FunctionName))
+            _logger.LogDebug($"[Calling: {update.FunctionName}] ");
+    }
+
+    private void HandleOutputDelta(OutputDeltaUpdate delta, ReceiveContext ctx)
+    {
+        if (!string.IsNullOrEmpty(delta.AudioTranscript))
+            _logger.LogDebug(delta.AudioTranscript);
+
+        if (!string.IsNullOrEmpty(delta.Text))
+            _logger.LogDebug($"[TextDelta: {delta.Text}]");
+
+        BufferOutputAudio(delta, ctx);
+        AccumulateFunctionArguments(delta, ctx);
+    }
+
+    private void BufferOutputAudio(OutputDeltaUpdate delta, ReceiveContext ctx)
+    {
+        if (delta.AudioBytes is null)
+            return;
+
+        lock (_outputAudioLock)
+        {
+            if (_playbackState.BargeInTriggered)
+                return;
+
+            var audioBytes = delta.AudioBytes.ToArray();
+            ctx.OutputAudioBuffer.AddRange(audioBytes);
+
+            while (ctx.OutputAudioBuffer.Count >= SpeakerChunkSize)
+            {
+                byte[] chunk = new byte[SpeakerChunkSize];
+                ctx.OutputAudioBuffer.CopyTo(0, chunk, 0, SpeakerChunkSize);
+                ctx.OutputAudioBuffer.RemoveRange(0, SpeakerChunkSize);
+                WriteSpeakerSafe(chunk);
+            }
+        }
+    }
+
+    private void AccumulateFunctionArguments(OutputDeltaUpdate delta, ReceiveContext ctx)
+    {
+        if (string.IsNullOrWhiteSpace(delta.FunctionArguments))
+            return;
+
+        if (delta.ItemId is null)
+            return;
+
+        if (!ctx.FunctionArgumentBuilders.TryGetValue(delta.ItemId, out var builder))
+            ctx.FunctionArgumentBuilders[delta.ItemId] = builder = new StringBuilder();
+
+        builder.Append(delta.FunctionArguments);
+        _logger.LogDebug($"[FunctionArgsDelta: ItemId={delta.ItemId}, FunctionCallId={delta.FunctionCallId ?? "null"}, Args={delta.FunctionArguments}]");
+    }
+
+    private async Task HandleStreamingFinishedAsync(OutputStreamingFinishedUpdate update, ReceiveContext ctx)
+    {
+        _logger.LogDebug($"[OutputStreamingFinished: FunctionCallId={update.FunctionCallId ?? "null"}, FunctionName={update.FunctionName ?? "null"}, ItemId={update.ItemId ?? "null"}]");
+
+        if (update.FunctionCallId is null)
+            return;
+
+        if (_kernel == null)
+        {
+            throw new InvalidOperationException(
+                $"Function '{update.FunctionName}' was called but kernel is null. " +
+                "A kernel must be provided when tools are configured in the session.");
+        }
+
+        _logger.LogDebug($"[Executing function: {update.FunctionName}]");
+
+        RealtimeItem functionOutputItem;
+        try
+        {
+            functionOutputItem = await KernelToolInvoker.InvokeFunctionAsync(
+                update.FunctionName, update.FunctionCallId, update.ItemId,
+                ctx.FunctionArgumentBuilders, _kernel, ctx.SessionToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"[Function '{update.FunctionName}' failed: {ex.Message}]");
+            functionOutputItem = RealtimeItem.CreateFunctionCallOutput(
+                callId: update.FunctionCallId,
+                output: $"Error: {ex.Message}");
+        }
+        finally
+        {
+            ctx.FunctionArgumentBuilders.Remove(update.ItemId);
+        }
+
+        await ctx.Session.AddItemAsync(functionOutputItem, ctx.SessionToken);
+    }
+
+    private async Task HandleResponseFinishedAsync(ResponseFinishedUpdate update, ReceiveContext ctx)
+    {
+        ClearWaitingForResponse();
+        FlushRemainingOutputAudio(ctx);
+
+        await FlushSpeakerSafeAsync(ctx.SessionToken);
+        SetModelSpeaking(false);
+        _stateUpdateAction?.Invoke(StateUpdate.SpeakingStopped);
+
+        _logger.LogDebug($"[ResponseFinished: {update.CreatedItems.Count} items created]");
+        foreach (var item in update.CreatedItems)
+            _logger.LogDebug($"  - Item: FunctionName={item.FunctionName ?? "null"}, FunctionCallId={item.FunctionCallId ?? "null"}, MessageRole={item.MessageRole}");
+
+        if (update.CreatedItems.Any(item => item.FunctionName?.Length > 0))
+        {
+            _logger.LogDebug("[Function calls detected - triggering response...]");
+            SetWaitingForResponse();
+            await ctx.Session.StartResponseAsync(ctx.SessionToken);
+        }
+        else
+        {
+            _logger.LogDebug("[Ready for your next question...]");
+        }
+    }
+
+    private void FlushRemainingOutputAudio(ReceiveContext ctx)
+    {
+        lock (_outputAudioLock)
+        {
+            if (ctx.OutputAudioBuffer.Count == 0 || _playbackState.BargeInTriggered)
+                return;
+
+            byte[] remainingChunk = new byte[ctx.OutputAudioBuffer.Count];
+            ctx.OutputAudioBuffer.CopyTo(remainingChunk, 0);
+            WriteSpeakerSafe(remainingChunk);
+            ctx.OutputAudioBuffer.Clear();
+        }
+    }
+
+    // Audio capture loop - local VAD, recording, barge-in
+
+    private async Task<RealtimeAgentRunResult> AudioCaptureLoopAsync(AudioCaptureContext ctx)
+    {
+        ctx.Recorder.Start();
+        ctx.Speaker.Start();
+
+        try
+        {
+            while (!ctx.CancellationToken.IsCancellationRequested)
+            {
+                var frame = ctx.Recorder.Read();
+                double frameDurationMs = (frame.Length * 1000.0) / ctx.Recorder.SampleRate;
+                bool isSpeech = DetectSpeech(frame, ctx.Recorder.SampleRate, ctx.VadDetector);
+                UpdateActivityTracking(ctx.State, isSpeech);
+
+                await TryHandleBargeInAsync(isSpeech, ctx);
+                MaintainPreBuffer(frame, ctx.Recorder.SampleRate, ctx.State);
+                await ProcessRecordingStateAsync(frame, frameDurationMs, isSpeech, ctx);
+                EnforceResponseWaitTimeout();
+
+                if (IsInactivityTimeoutReached(ctx.State))
                 {
-                    Description = toolDefinition.FunctionDescription,
-                    Parameters = toolDefinition.FunctionParameters
-                };
+                    _logger.LogDebug("[Inactivity timeout - pausing audio capture...]");
+                    return RealtimeAgentRunResult.InactivityTimeout;
+                }
+
+                await Task.Delay(1, ctx.CancellationToken);
             }
         }
-    }
-
-    /// <summary>
-    /// Parses a fully qualified function name into its component parts.
-    /// Format: "PluginName-FunctionName" or just "FunctionName".
-    /// </summary>
-    public (string FunctionName, string PluginName) ParseFunctionName(string fullyQualifiedName)
-    {
-        string pluginName = null;
-        string functionName = fullyQualifiedName;
-
-        int separatorPos = fullyQualifiedName.LastIndexOf(FunctionNameSeparator, StringComparison.Ordinal);
-        if (separatorPos >= 0)
+        catch (OperationCanceledException)
         {
-            pluginName = fullyQualifiedName.AsSpan(0, separatorPos).Trim().ToString();
-            functionName = fullyQualifiedName.AsSpan(separatorPos + FunctionNameSeparator.Length).Trim().ToString();
+            // Expected when cancellation is requested - session stays alive
+        }
+        finally
+        {
+            ctx.Recorder.Stop();
+            ctx.Speaker.Stop();
         }
 
-        return (functionName, pluginName);
+        return RealtimeAgentRunResult.Cancelled;
     }
 
-    /// <summary>
-    /// Deserializes JSON arguments string to KernelArguments.
-    /// </summary>
-    public KernelArguments DeserializeArguments(string argumentsString)
+    private static bool DetectSpeech(short[] frame, int recorderSampleRate, SileroVadDetector vadDetector)
     {
-        var arguments = JsonSerializer.Deserialize<KernelArguments>(argumentsString);
+        var vadFrame = AudioResampler.DownsampleForVad(frame, recorderSampleRate, VadSampleRate, FrameLength);
+        var floatFrame = new float[vadFrame.Length];
 
-        if (arguments is not null)
+        for (int i = 0; i < vadFrame.Length; i++)
+            floatFrame[i] = vadFrame[i] / 32768.0f;
+
+        return vadDetector.Process(floatFrame) >= VadThreshold;
+    }
+
+    private void UpdateActivityTracking(AudioCaptureState state, bool isSpeech)
+    {
+        bool modelIsSpeaking = IsModelSpeaking();
+
+        if (isSpeech)
+            state.LastActivityUtc = DateTime.UtcNow;
+
+        if (state.WasModelSpeaking && !modelIsSpeaking)
+            state.LastActivityUtc = DateTime.UtcNow;
+
+        state.WasModelSpeaking = modelIsSpeaking;
+    }
+
+    private async Task TryHandleBargeInAsync(bool isSpeech, AudioCaptureContext ctx)
+    {
+        var state = ctx.State;
+
+        if (!IsModelSpeaking())
         {
-            var names = arguments.Names.ToArray();
-            foreach (var name in names)
+            state.BargeInSpeechFrameCount = 0;
+            return;
+        }
+
+        if (!isSpeech)
+        {
+            state.BargeInSpeechFrameCount = 0;
+            return;
+        }
+
+        state.BargeInSpeechFrameCount++;
+        if (state.BargeInSpeechFrameCount < MinSpeechFramesForBargeIn)
+            return;
+
+        if (!TryStartBargeIn(out string truncateItemId))
+            return;
+
+        int audioEndMs = ctx.Speaker.GetEstimatedPlayedMilliseconds();
+        _logger.LogWarning($"[Barge-in detected - interrupting model at {audioEndMs}ms, ItemId={truncateItemId}]");
+        ClearSpeakerSafe();
+
+        try
+        {
+            await ctx.Session.CancelResponseAsync(ctx.SessionToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug($"[Cancel response failed (expected if generation already finished): {ex.Message}]");
+        }
+
+        if (truncateItemId is not null)
+        {
+            try
             {
-                arguments[name] = arguments[name]?.ToString();
+                await ctx.Session.TruncateItemAsync(truncateItemId, 0, TimeSpan.FromMilliseconds(audioEndMs), ctx.SessionToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[Truncate failed: {ex.Message}]");
             }
         }
 
-        return arguments;
+        SetModelSpeaking(false);
+        _stateUpdateAction?.Invoke(StateUpdate.SpeakingStopped);
+        state.IsRecording = true;
+        state.AudioBuffer.Clear();
+        state.SpeechFrameCount = 0;
+        state.BargeInSpeechFrameCount = 0;
+        state.SilenceDurationMs = 0;
+        ctx.VadDetector.Reset();
+    }
+
+    private static void MaintainPreBuffer(short[] frame, int recorderSampleRate, AudioCaptureState state)
+    {
+        if (state.IsRecording)
+            return;
+
+        var upsampledFrame = AudioResampler.UpsampleTo24kHz(frame, recorderSampleRate);
+        state.PreBuffer.Enqueue(upsampledFrame);
+
+        while (state.PreBuffer.Count > PreBufferFrames)
+            state.PreBuffer.Dequeue();
+    }
+
+    private async Task ProcessRecordingStateAsync(
+        short[] frame, double frameDurationMs, bool isSpeech, AudioCaptureContext ctx)
+    {
+        var state = ctx.State;
+
+        if (!state.IsRecording && !IsModelSpeaking())
+        {
+            TryStartRecording(isSpeech, state);
+            return;
+        }
+
+        if (!state.IsRecording)
+            return;
+
+        await ContinueOrStopRecordingAsync(frame, frameDurationMs, isSpeech, ctx);
+    }
+
+    private void TryStartRecording(bool isSpeech, AudioCaptureState state)
+    {
+        if (!isSpeech)
+        {
+            state.SpeechFrameCount = 0;
+            return;
+        }
+
+        state.SpeechFrameCount++;
+        if (state.SpeechFrameCount < MinSpeechFrames)
+            return;
+
+        _logger.LogDebug("[Voice detected - recording...]");
+        state.IsRecording = true;
+        state.AudioBuffer.Clear();
+
+        while (state.PreBuffer.Count > 0)
+            state.AudioBuffer.AddRange(state.PreBuffer.Dequeue());
+
+        state.SilenceDurationMs = 0;
+    }
+
+    private async Task ContinueOrStopRecordingAsync(
+        short[] frame, double frameDurationMs, bool isSpeech, AudioCaptureContext ctx)
+    {
+        var state = ctx.State;
+        var upsampledFrame = AudioResampler.UpsampleTo24kHz(frame, ctx.Recorder.SampleRate);
+        state.AudioBuffer.AddRange(upsampledFrame);
+
+        if (isSpeech)
+        {
+            state.SilenceDurationMs = 0;
+            return;
+        }
+
+        state.SilenceDurationMs += frameDurationMs;
+        if (state.SilenceDurationMs < SilenceMillisecondsToStop)
+            return;
+
+        _logger.LogDebug("[Silence detected - sending to model...]");
+
+        var audioBytes = AudioResampler.ShortsToBytes(state.AudioBuffer.ToArray());
+        await ctx.Session.SendInputAudioAsync(new MemoryStream(audioBytes), ctx.CancellationToken);
+        await ctx.Session.CommitPendingAudioAsync(ctx.CancellationToken);
+        await ctx.Session.StartResponseAsync(ctx.CancellationToken);
+        SetWaitingForResponse();
+
+        state.IsRecording = false;
+        state.AudioBuffer.Clear();
+        state.SilenceDurationMs = 0;
+        state.SpeechFrameCount = 0;
+        ctx.VadDetector.Reset();
+    }
+
+    private void EnforceResponseWaitTimeout()
+    {
+        if (!TryExpireWaitingForResponse(TimeSpan.FromSeconds(30)))
+            return;
+
+        _logger.LogWarning("[Response wait timeout - model did not respond within 30s]");
+    }
+
+    private bool IsInactivityTimeoutReached(AudioCaptureState state)
+    {
+        GetModelAndWaitingState(out bool modelIsSpeaking, out bool waitingForResponse);
+        if (state.IsRecording || modelIsSpeaking || waitingForResponse)
+            return false;
+
+        var timeout = TimeSpan.FromSeconds(_options.ConversationInactivityTimeoutSeconds ?? 10);
+        return DateTime.UtcNow - state.LastActivityUtc >= timeout;
+    }
+
+    private void GetModelAndWaitingState(out bool modelIsSpeaking, out bool waitingForResponse)
+    {
+        lock (_outputAudioLock)
+        {
+            modelIsSpeaking = _playbackState.ModelIsSpeaking;
+            waitingForResponse = _playbackState.WaitingForResponse;
+        }
+    }
+
+    private bool IsModelSpeaking()
+    {
+        lock (_outputAudioLock)
+        {
+            return _playbackState.ModelIsSpeaking;
+        }
+    }
+
+    private void SetModelSpeaking(bool modelIsSpeaking)
+    {
+        lock (_outputAudioLock)
+        {
+            _playbackState.ModelIsSpeaking = modelIsSpeaking;
+        }
+    }
+
+    private void SetWaitingForResponse()
+    {
+        lock (_outputAudioLock)
+        {
+            _playbackState.WaitingForResponse = true;
+            _playbackState.ResponseRequestedAtUtc = DateTime.UtcNow;
+        }
+    }
+
+    private void ClearWaitingForResponse()
+    {
+        lock (_outputAudioLock)
+        {
+            _playbackState.WaitingForResponse = false;
+            _playbackState.ResponseRequestedAtUtc = default;
+        }
+    }
+
+    private bool TryExpireWaitingForResponse(TimeSpan maxWait)
+    {
+        lock (_outputAudioLock)
+        {
+            if (!_playbackState.WaitingForResponse)
+            {
+                return false;
+            }
+
+            if (DateTime.UtcNow - _playbackState.ResponseRequestedAtUtc <= maxWait)
+            {
+                return false;
+            }
+
+            _playbackState.WaitingForResponse = false;
+            _playbackState.ResponseRequestedAtUtc = default;
+            return true;
+        }
+    }
+
+    private bool TryStartBargeIn(out string truncateItemId)
+    {
+        lock (_outputAudioLock)
+        {
+            if (!_playbackState.ModelIsSpeaking)
+            {
+                truncateItemId = null;
+                return false;
+            }
+
+            _playbackState.BargeInTriggered = true;
+            truncateItemId = _playbackState.CurrentStreamingItemId;
+            return true;
+        }
+    }
+
+    // Thread-safe speaker access
+
+    private void WriteSpeakerSafe(byte[] data)
+    {
+        lock (_speakerLock) { _currentSpeaker?.Write(data); }
+    }
+
+    private void ClearSpeakerSafe()
+    {
+        lock (_speakerLock) { _currentSpeaker?.Clear(); }
+    }
+
+    private async Task FlushSpeakerSafeAsync(CancellationToken cancellationToken)
+    {
+        Speaker speaker;
+        lock (_speakerLock) { speaker = _currentSpeaker; }
+
+        if (speaker != null)
+            await speaker.FlushAsync(cancellationToken);
+    }
+
+    // Context / state types for the two concurrent loops
+
+    private sealed class PlaybackSyncState
+    {
+        public bool ModelIsSpeaking { get; set; }
+        public bool WaitingForResponse { get; set; }
+        public DateTime ResponseRequestedAtUtc { get; set; }
+        public bool BargeInTriggered { get; set; }
+        public string CurrentStreamingItemId { get; set; }
     }
 
     /// <summary>
-    /// Processes a function result into a string suitable for the Realtime API.
+    /// Bundles dependencies and per-loop state for the receive loop,
+    /// so handlers don't need many individual parameters.
     /// </summary>
-    public string ProcessFunctionResult(object functionResult)
+    private sealed class ReceiveContext
     {
-        if (functionResult is string stringResult)
+        public ReceiveContext(RealtimeSession session, CancellationToken sessionToken)
         {
-            return stringResult;
+            Session = session;
+            SessionToken = sessionToken;
         }
 
-        return JsonSerializer.Serialize(functionResult);
+        public RealtimeSession Session { get; }
+        public CancellationToken SessionToken { get; }
+        public List<byte> OutputAudioBuffer { get; } = new();
+        public Dictionary<string, StringBuilder> FunctionArgumentBuilders { get; } = new();
     }
-    #endregion 
+
+    /// <summary>
+    /// Bundles dependencies and per-loop state for the audio capture loop,
+    /// so handlers don't need many individual parameters.
+    /// </summary>
+    private sealed class AudioCaptureContext
+    {
+        public required RealtimeSession Session { get; init; }
+        public required PvRecorder Recorder { get; init; }
+        public required Speaker Speaker { get; init; }
+        public required SileroVadDetector VadDetector { get; init; }
+        public required CancellationToken SessionToken { get; init; }
+        public required CancellationToken CancellationToken { get; init; }
+        public AudioCaptureState State { get; } = new();
+    }
+
+    /// <summary>
+    /// Mutable state for one audio capture loop run (not shared across threads).
+    /// </summary>
+    private sealed class AudioCaptureState
+    {
+        public List<short> AudioBuffer { get; } = new();
+        public Queue<short[]> PreBuffer { get; } = new();
+        public bool IsRecording { get; set; }
+        public int SpeechFrameCount { get; set; }
+        public int BargeInSpeechFrameCount { get; set; }
+        public double SilenceDurationMs { get; set; }
+        public bool WasModelSpeaking { get; set; }
+        public DateTime LastActivityUtc { get; set; } = DateTime.UtcNow;
+    }
 }
