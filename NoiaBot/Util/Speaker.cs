@@ -83,6 +83,41 @@ public class Speaker : IDisposable
     }
 
     /// <summary>
+    /// Gets the number of queued samples that have not been consumed by playback yet.
+    /// </summary>
+    public int GetQueuedSampleCount()
+    {
+        lock (_bufferLock)
+        {
+            return _dataProvider?.SamplesAvailable ?? 0;
+        }
+    }
+
+    /// <summary>
+    /// Gets an estimate of how many samples have been consumed from the queue by the playback pipeline.
+    /// This tracks render progress, not exact speaker cone output timing.
+    /// </summary>
+    public long GetEstimatedPlayedSampleCount()
+    {
+        lock (_bufferLock)
+        {
+            return _dataProvider?.Position ?? 0;
+        }
+    }
+
+    /// <summary>
+    /// Gets an estimated played duration in milliseconds based on consumed queue samples.
+    /// </summary>
+    public int GetEstimatedPlayedMilliseconds()
+    {
+        if (_sampleRate <= 0)
+            return 0;
+
+        var playedSamples = GetEstimatedPlayedSampleCount();
+        return (int)((playedSamples * 1000L) / _sampleRate);
+    }
+
+    /// <summary>
     /// Updates the meter by reading the level meter and calling the registered callback.
     /// </summary>
     private void UpdateMeter(object state)

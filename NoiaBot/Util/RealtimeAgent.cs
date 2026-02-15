@@ -48,7 +48,7 @@ public sealed class RealtimeAgent : IDisposable
     private const float VadThreshold = 0.5f;
     private const int MinSpeechFrames = 3; // Minimum consecutive speech frames to start recording
     private const int MinSpeechFramesForBargeIn = 2; // Fewer frames needed for barge-in (faster response)
-    private const int SilenceFramesToStop = 50; // ~1.6 seconds of silence to stop recording
+    private const double SilenceMillisecondsToStop = 1600; // Stop after ~1.6s of silence
     private const int PreBufferFrames = 15; // Keep ~0.5s of audio before speech is detected
 
     private readonly Kernel _kernel;
@@ -65,6 +65,7 @@ public sealed class RealtimeAgent : IDisposable
     private Task _receiveTask;
     // Session CTS is independent - only cancelled on dispose, not on RunAsync cancellation
     private CancellationTokenSource _sessionCts;
+    private int _receiveGeneration;
 
     // Shared state between receive task and audio loop
     private Speaker _currentSpeaker;
@@ -77,7 +78,6 @@ public sealed class RealtimeAgent : IDisposable
     // Barge-in tracking for truncation
     private readonly object _outputAudioLock = new();
     private string _currentStreamingItemId;
-    private int _audioBytesSentToSpeaker;
 
     public RealtimeAgent(ILogger<RealtimeAgent> logger, Kernel kernel, IOptions<RealtimeAgentOptions> options)
     {
@@ -151,7 +151,8 @@ public sealed class RealtimeAgent : IDisposable
         // Start the receive task if not already running
         if (_receiveTask is null || _receiveTask.IsCompleted)
         {
-            _receiveTask = RunReceiveTaskAsync(_session, _sessionCts!.Token);
+            int receiveGeneration = System.Threading.Interlocked.Increment(ref _receiveGeneration);
+            _receiveTask = RunReceiveTaskAsync(_session, _sessionCts!.Token, receiveGeneration);
         }
 
         _stateUpdateAction = stateUpdateAction;
@@ -159,7 +160,7 @@ public sealed class RealtimeAgent : IDisposable
         stateUpdateAction?.Invoke(StateUpdate.Ready);
 
         // Start the conversation loop (audio capture)
-        var result = await AudioCaptureLoopAsync(_session, recorder, speaker, vadDetector, cancellationToken);
+        var result = await AudioCaptureLoopAsync(_session, recorder, speaker, vadDetector, _sessionCts!.Token, cancellationToken);
 
         // Clear speaker reference when exiting
         lock (_speakerLock)
@@ -184,7 +185,12 @@ public sealed class RealtimeAgent : IDisposable
         {
             try
             {
-                await _receiveTask;
+                // Don't wait forever - websocket may be stuck and not observe cancellation
+                var completedTask = await Task.WhenAny(_receiveTask, Task.Delay(TimeSpan.FromSeconds(5)));
+                if (!ReferenceEquals(completedTask, _receiveTask))
+                {
+                    _logger.LogWarning("[ResetSession timed out waiting for receive task - continuing cleanup]");
+                }
             }
             catch
             {
@@ -246,16 +252,17 @@ public sealed class RealtimeAgent : IDisposable
     /// Receive task that runs for the lifetime of the session.
     /// Uses the session-level cancellation token, not the per-RunAsync token.
     /// </summary>
-    private async Task RunReceiveTaskAsync(RealtimeSession session, CancellationToken sessionToken)
+    private async Task RunReceiveTaskAsync(RealtimeSession session, CancellationToken sessionToken, int receiveGeneration)
     {
         var outputAudioBuffer = new List<byte>();
-        const int SpeakerChunkSize = 16384;
+        const int SpeakerChunkSize = 4096; // ~85ms at 24kHz/16-bit (lower = less latency, snappier barge-in)
 
         try
         {
             await foreach (RealtimeUpdate update in session.ReceiveUpdatesAsync(sessionToken))
             {
                 if (sessionToken.IsCancellationRequested) break;
+                if (receiveGeneration != System.Threading.Volatile.Read(ref _receiveGeneration)) break;
 
                 // Session started
                 if (update is ConversationSessionStartedUpdate sessionStartedUpdate)
@@ -275,7 +282,6 @@ public sealed class RealtimeAgent : IDisposable
                     {
                         outputAudioBuffer.Clear();
                         _currentStreamingItemId = streamingStartedUpdate.ItemId;
-                        _audioBytesSentToSpeaker = 0;
                     }
 
                     _logger.LogDebug($"[OutputStreamingStarted: FunctionName={streamingStartedUpdate.FunctionName ?? "null"}, ItemId={streamingStartedUpdate.ItemId ?? "null"}]");
@@ -314,7 +320,6 @@ public sealed class RealtimeAgent : IDisposable
                                     outputAudioBuffer.CopyTo(0, chunk, 0, SpeakerChunkSize);
                                     outputAudioBuffer.RemoveRange(0, SpeakerChunkSize);
                                     WriteSpeakerSafe(chunk);
-                                    _audioBytesSentToSpeaker += SpeakerChunkSize;
                                 }
                             }
                         }
@@ -370,6 +375,11 @@ public sealed class RealtimeAgent : IDisposable
                                 callId: streamingFinishedUpdate.FunctionCallId,
                                 output: $"Error: {ex.Message}");
                         }
+                        finally
+                        {
+                            // Remove builder to prevent unbounded memory growth in long sessions
+                            _functionArgumentBuildersById.Remove(streamingFinishedUpdate.ItemId);
+                        }
 
                         await session.AddItemAsync(functionOutputItem, sessionToken);
                     }
@@ -398,7 +408,6 @@ public sealed class RealtimeAgent : IDisposable
                             byte[] remainingChunk = new byte[outputAudioBuffer.Count];
                             outputAudioBuffer.CopyTo(remainingChunk, 0);
                             WriteSpeakerSafe(remainingChunk);
-                            _audioBytesSentToSpeaker += remainingChunk.Length;
                             outputAudioBuffer.Clear();
                         }
                     }
@@ -494,13 +503,15 @@ public sealed class RealtimeAgent : IDisposable
         PvRecorder recorder,
         Speaker speaker,
         SileroVadDetector vadDetector,
+        CancellationToken sessionToken,
         CancellationToken cancellationToken)
     {
         var audioBuffer = new List<short>();
         var preBuffer = new Queue<short[]>();
         bool isRecording = false;
         int speechFrameCount = 0;
-        int silenceFrameCount = 0;
+        int bargeInSpeechFrameCount = 0;
+        double silenceDurationMs = 0;
         bool wasModelSpeaking = false;
         var lastActivityUtc = DateTime.UtcNow;
 
@@ -512,6 +523,7 @@ public sealed class RealtimeAgent : IDisposable
             while (!cancellationToken.IsCancellationRequested)
             {
                 var frame = recorder.Read();
+                double frameDurationMs = (frame.Length * 1000.0) / recorder.SampleRate;
 
                 // Downsample from recorder rate to VAD rate if needed
                 var vadFrame = DownsampleForVad(frame, recorder.SampleRate, VadSampleRate, FrameLength);
@@ -538,52 +550,64 @@ public sealed class RealtimeAgent : IDisposable
                 }
                 wasModelSpeaking = _modelIsSpeaking;
 
-                // If model is speaking and we detect speech, trigger barge-in
-                if (_modelIsSpeaking && isSpeech)
+                // If model is speaking, require consecutive speech frames before barge-in
+                if (_modelIsSpeaking)
                 {
-                    speechFrameCount++;
-                    if (speechFrameCount >= MinSpeechFramesForBargeIn)
+                    if (isSpeech)
                     {
-                        // Calculate playback position before clearing
-                        // 24kHz mono 16-bit = 48000 bytes/second
-                        string truncateItemId;
-                        int audioEndMs;
-                        
-                        lock (_outputAudioLock)
+                        bargeInSpeechFrameCount++;
+                        if (bargeInSpeechFrameCount >= MinSpeechFramesForBargeIn)
                         {
-                            _bargeInTriggered = true;
-                            truncateItemId = _currentStreamingItemId;
-                            audioEndMs = (int)((_audioBytesSentToSpeaker / 48000.0) * 1000);
-                        }
-                        
-                        _logger.LogWarning($"[Barge-in detected - interrupting model at {audioEndMs}ms, ItemId={truncateItemId}]");
-
-                        ClearSpeakerSafe(); // Clear buffered audio immediately
-
-                        try
-                        {
-                            await session.CancelResponseAsync(cancellationToken);
+                            string truncateItemId;
                             
-                            // TODO: Call TruncateItemAsync when SDK supports it
-                            // This tells the server how much audio the user actually heard
-                            // Without truncate, the server's conversation history contains
-                            // the full response, causing the model to continue from where
-                            // it generated (not where the user interrupted)
-                            await session.TruncateItemAsync(truncateItemId, 0, TimeSpan.FromMilliseconds(audioEndMs), cancellationToken);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogDebug($"[Cancel/truncate failed: {ex.Message}]");
-                        }
+                            lock (_outputAudioLock)
+                            {
+                                _bargeInTriggered = true;
+                                truncateItemId = _currentStreamingItemId;
+                            }
 
-                        _modelIsSpeaking = false;
-                        _stateUpdateAction?.Invoke(StateUpdate.SpeakingStopped);
-                        isRecording = true;
-                        audioBuffer.Clear();
-                        vadDetector.Reset();
-                        speechFrameCount = 0;
-                        silenceFrameCount = 0;
+                            // Estimate heard audio from playback consumption instead of bytes written.
+                            // This is closer to what reached the user than queued/written byte counts.
+                            int audioEndMs = speaker.GetEstimatedPlayedMilliseconds();
+                            
+                            _logger.LogWarning($"[Barge-in detected - interrupting model at {audioEndMs}ms, ItemId={truncateItemId}]");
+
+                            ClearSpeakerSafe(); // Clear buffered audio immediately
+
+                            try
+                            {
+                                await session.CancelResponseAsync(sessionToken);
+                                
+                                if (truncateItemId is not null)
+                                {
+                                    // Tell the server how much audio the user actually heard
+                                    // so its conversation history matches reality
+                                    await session.TruncateItemAsync(truncateItemId, 0, TimeSpan.FromMilliseconds(audioEndMs), sessionToken);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogDebug($"[Cancel/truncate failed: {ex.Message}]");
+                            }
+
+                            _modelIsSpeaking = false;
+                            _stateUpdateAction?.Invoke(StateUpdate.SpeakingStopped);
+                            isRecording = true;
+                            audioBuffer.Clear();
+                            vadDetector.Reset();
+                            speechFrameCount = 0;
+                            bargeInSpeechFrameCount = 0;
+                            silenceDurationMs = 0;
+                        }
                     }
+                    else
+                    {
+                        bargeInSpeechFrameCount = 0;
+                    }
+                }
+                else
+                {
+                    bargeInSpeechFrameCount = 0;
                 }
 
                 // Maintain pre-buffer when not recording
@@ -610,7 +634,7 @@ public sealed class RealtimeAgent : IDisposable
                             while (preBuffer.Count > 0)
                                 audioBuffer.AddRange(preBuffer.Dequeue());
 
-                            silenceFrameCount = 0;
+                            silenceDurationMs = 0;
                         }
                     }
                     else
@@ -625,12 +649,12 @@ public sealed class RealtimeAgent : IDisposable
 
                     if (isSpeech)
                     {
-                        silenceFrameCount = 0;
+                        silenceDurationMs = 0;
                     }
                     else
                     {
-                        silenceFrameCount++;
-                        if (silenceFrameCount >= SilenceFramesToStop)
+                        silenceDurationMs += frameDurationMs;
+                        if (silenceDurationMs >= SilenceMillisecondsToStop)
                         {
                             _logger.LogDebug("[Silence detected - sending to model...]");
 
@@ -643,7 +667,7 @@ public sealed class RealtimeAgent : IDisposable
 
                             isRecording = false;
                             audioBuffer.Clear();
-                            silenceFrameCount = 0;
+                            silenceDurationMs = 0;
                             speechFrameCount = 0;
                             vadDetector.Reset();
                         }
@@ -716,9 +740,19 @@ public sealed class RealtimeAgent : IDisposable
 
         for (int i = 0; i < outputLength; i++)
         {
-            int srcIndex = (int)(i / ratio);
-            if (srcIndex < input.Length)
+            double srcPos = i / ratio;
+            int srcIndex = (int)srcPos;
+            double frac = srcPos - srcIndex;
+
+            if (srcIndex + 1 < input.Length)
+            {
+                // Linear interpolation between adjacent samples
+                result[i] = (short)(input[srcIndex] * (1.0 - frac) + input[srcIndex + 1] * frac);
+            }
+            else if (srcIndex < input.Length)
+            {
                 result[i] = input[srcIndex];
+            }
         }
 
         return result;
@@ -733,23 +767,28 @@ public sealed class RealtimeAgent : IDisposable
 
     private RealtimeClient GetRealtimeConversationClient()
     {
-        if (!string.IsNullOrEmpty(_options.OpenAiApiKey) && string.IsNullOrEmpty(_options.OpenAiEndpoint))
+        var apiKey = _options.OpenAiApiKey;
+        var endpoint = _options.OpenAiEndpoint;
+
+        // OpenAI (platform) usage: API key set, endpoint not set
+        if (!string.IsNullOrWhiteSpace(apiKey) && string.IsNullOrWhiteSpace(endpoint))
         {
-            return new RealtimeClient(new ApiKeyCredential(_options.OpenAiApiKey));
+            return new RealtimeClient(new ApiKeyCredential(apiKey));
         }
-        else if (!string.IsNullOrEmpty(_options.OpenAiApiKey) && string.IsNullOrEmpty(_options.OpenAiEndpoint))
+
+        // Azure OpenAI usage: API key set, endpoint set
+        if (!string.IsNullOrWhiteSpace(apiKey) && !string.IsNullOrWhiteSpace(endpoint))
         {
             var client = new AzureOpenAIClient(
-                endpoint: new Uri(_options.OpenAiEndpoint),
-                credential: new ApiKeyCredential(_options.OpenAiApiKey));
+                endpoint: new Uri(endpoint),
+                credential: new ApiKeyCredential(apiKey)); // If your package expects AzureKeyCredential, swap it
 
             return client.GetRealtimeClient();
         }
-        else
-        {
-            throw new Exception("OpenAI/Azure OpenAI configuration was not found. " +
-                "Please set your API key in user secrets or environment variables.");
-        }
+
+        throw new InvalidOperationException(
+            "OpenAI/Azure OpenAI configuration was not found. " +
+            "Please set OpenAiApiKey and optionally OpenAiEndpoint.");
     }
 
     #region ToolHelpers
@@ -844,7 +883,7 @@ public sealed class RealtimeAgent : IDisposable
         string pluginName = null;
         string functionName = fullyQualifiedName;
 
-        int separatorPos = fullyQualifiedName.IndexOf(FunctionNameSeparator, StringComparison.Ordinal);
+        int separatorPos = fullyQualifiedName.LastIndexOf(FunctionNameSeparator, StringComparison.Ordinal);
         if (separatorPos >= 0)
         {
             pluginName = fullyQualifiedName.AsSpan(0, separatorPos).Trim().ToString();
@@ -887,5 +926,3 @@ public sealed class RealtimeAgent : IDisposable
     }
     #endregion 
 }
-
-
